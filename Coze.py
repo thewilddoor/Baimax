@@ -7,13 +7,25 @@ import pandas as pd
 
 class Coze:
     def __init__(self,
-                 bot_id=None,
-                 api_token=None,
+                 bot_id,
+                 api_token,
                  user_id="default_user",
                  max_chat_rounds=3,
                  stream=False,
                  history=None,
                  conversation_id=None):
+        """
+        Initializes the Coze bot instance.
+
+        Parameters:
+        - bot_id (str): The unique identifier for your bot.
+        - api_token (str): Your API token for authentication.
+        - user_id (str): The user's unique identifier.
+        - max_chat_rounds (int): The maximum number of chat rounds to keep in history.
+        - stream (bool): Whether to use streaming responses.
+        - history (list): The chat history.
+        - conversation_id (str): The conversation identifier.
+        """
         self.bot_id = bot_id
         self.api_token = api_token
         self.user_id = user_id
@@ -26,101 +38,144 @@ class Coze:
             'Authorization': f'Bearer {self.api_token}',
             'Content-Type': 'application/json',
             'Accept': '*/*',
-            'Host': 'api.coze.com',
             'Connection': 'keep-alive'
         }
 
     @staticmethod
     def generate_conversation_id():
+        """
+        Generates a random conversation ID.
+        """
         return str(random.randint(100000000000, 999999999999))
 
-    @classmethod
-    def build_messages(cls, history=None):
+    @staticmethod
+    def build_messages(history):
+        """
+        Builds the message history in the required format.
+
+        Parameters:
+        - history (list): A list of (prompt, response) tuples.
+
+        Returns:
+        - messages (list): A list of message dictionaries.
+        """
         messages = []
-        history = history if history else [] 
         for prompt, response in history:
-            pair = [{"role": "user", "content": prompt, "content_type": "text"},
-                    {"role": "assistant", "content": response}]
-            messages.extend(pair)
+            messages.append({
+                "role": "user",
+                "content": prompt,
+                "content_type": "text"
+            })
+            messages.append({
+                "role": "assistant",
+                "content": response,
+                "content_type": "text"
+            })
         return messages
 
     @staticmethod
     def get_response(messages):
-        dfmsg = pd.DataFrame(messages)
-        dftool = dfmsg.loc[dfmsg['type'] == 'function_call']
-        for content in dftool['content']:
-            info = json.loads(content)
-            s = 'call function: ' + str(info['name']) + '; args =' + str(info['arguments'])
-            print(s, file=sys.stderr)
-        dfans = dfmsg.loc[dfmsg['type'] == 'answer']
-        if len(dfans) > 0:
-            response = ''.join(dfans['content'].tolist())
-        else:
-            response = ''
-        return response
+        """
+        Extracts the assistant's response from the messages.
 
-    def chat(self, query, stream=False):
+        Parameters:
+        - messages (list): A list of message dictionaries.
+
+        Returns:
+        - response (str): The assistant's response.
+        """
+        response_parts = []
+        for message in messages:
+            if message.get('role') == 'assistant':
+                response_parts.append(message.get('content', ''))
+        response = ''.join(response_parts)
+        return response.strip()
+
+    def chat(self, query):
+        """
+        Sends a chat message to the Coze Bot API and returns the response.
+
+        Parameters:
+        - query (str): The user's input message.
+
+        Returns:
+        - response (str): The assistant's response.
+        """
+        # Limit the chat history to the maximum allowed rounds
+        if len(self.history) > self.max_chat_rounds:
+            self.history = self.history[-self.max_chat_rounds:]
+
+        # Build the payload
         data = {
             "conversation_id": self.conversation_id,
             "bot_id": self.bot_id,
             "user": self.user_id,
             "query": query,
-            "stream": stream,
+            "stream": self.stream,
             "chat_history": self.build_messages(self.history)
         }
-        json_data = json.dumps(data)
-        response = ""
+
+        response_text = ""
 
         try:
-            result = requests.post(self.url, headers=self.headers, 
-                                   data=json_data, stream=data["stream"])
+            result = requests.post(
+                self.url,
+                headers=self.headers,
+                json=data,
+                stream=self.stream
+            )
 
             if result.status_code == 200:
-                if not data["stream"]:
-                    dic = json.loads(result.content.decode('utf-8'))
-                    if 'messages' in dic:
-                        response = self.get_response(dic['messages'])
+                if not self.stream:
+                    result_json = result.json()
+                    if 'messages' in result_json:
+                        response_text = self.get_response(result_json['messages'])
                     else:
-                        response = "Sorry, I didn't understand the response from the server."
+                        response_text = "I'm sorry, I didn't receive a proper response."
                 else:
+                    # Handle streaming responses
                     messages = []
                     for line in result.iter_lines():
-                        if not line:
-                            continue
-                        try:
-                            line = line.decode('utf-8')
-                            line = line[5:] if line.startswith('data:') else line
-                            dic = json.loads(line)
-                            if dic['event'] == 'message':
-                                messages.append(dic['message'])
-                            if 'messages' in dic:
-                                response = self.get_response(messages)
-                        except Exception as err:
-                            print(f"Error during streaming: {err}")
-                            break 
+                        if line:
+                            decoded_line = line.decode('utf-8')
+                            if decoded_line.startswith('data:'):
+                                decoded_line = decoded_line[5:].strip()
+                            try:
+                                message_json = json.loads(decoded_line)
+                                if message_json.get('event') == 'message':
+                                    messages.append(message_json.get('message', {}))
+                            except json.JSONDecodeError:
+                                continue
+                    response_text = self.get_response(messages)
             else:
-                print(f"Request failed, status code: {result.status_code}")
-                response = "Sorry, there was a problem with the request."
-
-        except KeyError as e:
-            print(f"KeyError: {e}")
-            print(f"Full response was: {result.content.decode('utf-8')}")
-            response = "Sorry, I encountered an error while processing the response."
-
+                print(f"Request failed with status code: {result.status_code}", file=sys.stderr)
+                response_text = "I'm sorry, there was an error processing your request."
+        except requests.exceptions.RequestException as e:
+            print(f"Request exception: {e}", file=sys.stderr)
+            response_text = "I'm sorry, I couldn't reach the server."
         finally:
             result.close()
 
-        return response
+        # Update the history
+        self.history.append((query, response_text))
+        return response_text
 
     def __call__(self, query):
-        len_his = len(self.history)
-        if len_his >= self.max_chat_rounds:
-            self.history = self.history[len_his - self.max_chat_rounds:]
-        response = self.chat(query, stream=self.stream)
-        self.history.append((query, response))
-        return response
+        """
+        Enables the class instance to be called like a function.
+
+        Parameters:
+        - query (str): The user's input message.
+
+        Returns:
+        - response (str): The assistant's response.
+        """
+        return self.chat(query)
 
     def reset(self):
+        """
+        Resets the conversation history and generates a new conversation ID.
+        """
         self.history = []
         self.conversation_id = self.generate_conversation_id()
-        print("Conversation history reset.")
+        print("Conversation history has been reset.")
